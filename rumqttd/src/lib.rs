@@ -52,6 +52,9 @@ pub type AuthHandler = Arc<
         + Send
         + Sync,
 >;
+/// Called only with the organization from a verified client certificate (never CONNECT input).
+/// Arguments are the MQTT client ID and the certificate subject O, respectively.
+pub type ClientCertAuthHandler = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct Config {
@@ -135,6 +138,15 @@ impl ServerSettings {
     {
         self.connections.set_acl_handler(acl_fn)
     }
+
+    /// Enable certificate authentication on this listener. Requires rustls with
+    /// `verify-client-cert` and a configured CA; never falls back to password auth.
+    pub fn set_client_cert_auth_handler<F>(&mut self, auth_fn: F)
+    where
+        F: Fn(&str, &str) -> bool + Send + Sync + 'static,
+    {
+        self.connections.external_cert_auth = Some(Arc::new(auth_fn));
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -157,6 +169,8 @@ pub struct ConnectionSettings {
     pub auth: Option<HashMap<String, String>>,
     #[serde(skip)]
     pub external_auth: Option<AuthHandler>,
+    #[serde(skip)]
+    pub external_cert_auth: Option<ClientCertAuthHandler>,
     #[serde(skip)]
     pub external_acl: Option<AclHandler>,
     #[serde(default)]
@@ -190,6 +204,7 @@ impl fmt::Debug for ConnectionSettings {
             .field("max_inflight_count", &self.max_inflight_count)
             .field("auth", &self.auth)
             .field("external_auth", &self.external_auth.is_some())
+            .field("external_cert_auth", &self.external_cert_auth.is_some())
             .field("external_acl", &self.external_acl.is_some())
             .field("dynamic_filters", &self.dynamic_filters)
             .finish()

@@ -68,10 +68,10 @@ impl<P: Protocol> RemoteLink<P> {
         connect_packet: Packet,
         dynamic_filters: bool,
         assigned_client_id: Option<String>,
-        auth_configured: bool,
+        authenticated_username: Option<String>,
         acl_handler: Option<crate::AclHandler>,
     ) -> Result<RemoteLink<P>, Error> {
-        let Packet::Connect(connect, props, lastwill, lastwill_props, login) = connect_packet
+        let Packet::Connect(connect, props, lastwill, lastwill_props, _login) = connect_packet
         else {
             return Err(Error::NotConnectPacket(connect_packet));
         };
@@ -79,11 +79,11 @@ impl<P: Protocol> RemoteLink<P> {
         // Register this connection with the router. Router replys with ack which if ok will
         // start the link. Router can sometimes reject the connection (ex max connection limit)
         let client_id = assigned_client_id.as_ref().unwrap_or(&connect.client_id);
-        let identity = if auth_configured {
-            let username = login.ok_or(Error::InvalidAuth)?.username;
-            ClientIdentity::authenticated(client_id.to_owned(), username, tenant_id.clone())
-        } else {
-            ClientIdentity::unauthenticated(client_id.to_owned(), tenant_id.clone())
+        let identity = match authenticated_username {
+            Some(username) => {
+                ClientIdentity::authenticated(client_id.to_owned(), username, tenant_id.clone())
+            }
+            None => ClientIdentity::unauthenticated(client_id.to_owned(), tenant_id.clone()),
         };
         let clean_session = connect.clean_session;
 
@@ -184,7 +184,8 @@ impl<P: Protocol> RemoteLink<P> {
 pub async fn mqtt_connect<P>(
     config: Arc<ConnectionSettings>,
     network: &mut Network<P>,
-) -> Result<Packet, Error>
+    verified_cert_org: Option<&str>,
+) -> Result<(Packet, Option<String>), Error>
 where
     P: Protocol,
 {
@@ -205,7 +206,13 @@ where
 
     Span::current().record("client_id", &connect.client_id);
 
-    handle_auth(config.clone(), login.as_ref(), &connect.client_id).await?;
+    let authenticated_username = handle_auth(
+        &config,
+        login.as_ref(),
+        &connect.client_id,
+        verified_cert_org,
+    )
+    .await?;
 
     // When keep_alive feature is disabled client can live forever, which is not good in
     // distributed broker context so currenlty we don't allow it.
@@ -228,17 +235,29 @@ where
         return Err(Error::InvalidClientId);
     }
 
-    // Ok((connect, props, lastwill, lastwill_props))
-    Ok(packet)
+    Ok((packet, authenticated_username))
 }
 
 async fn handle_auth(
-    config: Arc<ConnectionSettings>,
+    config: &ConnectionSettings,
     login: Option<&Login>,
     client_id: &str,
-) -> Result<(), Error> {
+    verified_cert_org: Option<&str>,
+) -> Result<Option<String>, Error> {
+    // A certificate listener must authenticate using the verified certificate, never
+    // a CONNECT password. A plaintext listener cannot claim a certificate identity.
+    if let Some(cert_auth) = &config.external_cert_auth {
+        let org = verified_cert_org.ok_or(Error::InvalidAuth)?;
+        if login.is_some_and(|login| login.username != org) || !cert_auth(client_id, org) {
+            return Err(Error::InvalidAuth);
+        }
+        return Ok(Some(org.to_owned()));
+    }
+    if verified_cert_org.is_some() {
+        return Err(Error::InvalidAuth);
+    }
     if config.auth.is_none() && config.external_auth.is_none() {
-        return Ok(());
+        return Ok(None);
     }
 
     // if authentication is configured and connect packet doesn't have login details
@@ -261,13 +280,13 @@ async fn handle_auth(
             return Err(Error::InvalidAuth);
         }
 
-        return Ok(());
+        return Ok(Some(username.to_owned()));
     }
 
     if let Some(pairs) = &config.auth {
         if let Some(stored_password) = pairs.get(username) {
             if stored_password.as_bytes().ct_eq(password.as_bytes()).into() {
-                return Ok(());
+                return Ok(Some(username.to_owned()));
             }
         }
 
@@ -283,7 +302,15 @@ mod tests {
 
     use crate::{protocol::Login, ConnectionSettings};
 
-    use super::handle_auth;
+    use super::handle_auth as authenticate;
+
+    async fn handle_auth(
+        config: Arc<ConnectionSettings>,
+        login: Option<&Login>,
+        client_id: &str,
+    ) -> Result<Option<String>, super::Error> {
+        authenticate(&config, login, client_id, None).await
+    }
 
     fn config() -> ConnectionSettings {
         ConnectionSettings {
@@ -292,6 +319,7 @@ mod tests {
             max_inflight_count: 0,
             auth: None,
             external_auth: None,
+            external_cert_auth: None,
             external_acl: None,
             dynamic_filters: false,
         }
@@ -377,6 +405,76 @@ mod tests {
 
         let r = handle_auth(Arc::new(cfg), Some(&login), "").await;
         assert!(r.is_err());
+    }
+
+    #[tokio::test]
+    async fn verified_cert_auth_uses_org_not_connect_username_or_password() {
+        let mut cfg = config();
+        cfg.external_cert_auth = Some(Arc::new(|client, org| {
+            client == "device" && org == "Harbour"
+        }));
+        // A verified cert suffices without MQTT username/password.
+        assert_eq!(
+            authenticate(&cfg, None, "device", Some("Harbour"))
+                .await
+                .unwrap(),
+            Some("Harbour".into())
+        );
+        let same_username = Login {
+            username: "Harbour".into(),
+            password: "ignored".into(),
+        };
+        assert!(
+            authenticate(&cfg, Some(&same_username), "device", Some("Harbour"))
+                .await
+                .is_ok()
+        );
+        let spoof = Login {
+            username: "OtherTenant".into(),
+            password: "correct-service-password".into(),
+        };
+        assert!(authenticate(&cfg, Some(&spoof), "device", Some("Harbour"))
+            .await
+            .is_err());
+        assert!(authenticate(&cfg, Some(&same_username), "device", None)
+            .await
+            .is_err());
+        assert!(authenticate(&cfg, None, "wrong-device", Some("Harbour"))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn cert_auth_never_falls_back_to_service_auth_and_plain_service_still_works() {
+        let service = Login {
+            username: "service".into(),
+            password: "secret".into(),
+        };
+        let mut cfg = config();
+        cfg.auth = Some(HashMap::from([("service".into(), "secret".into())]));
+        cfg.external_cert_auth = Some(Arc::new(|_, _| false));
+        assert!(
+            authenticate(&cfg, Some(&service), "client", Some("Harbour"))
+                .await
+                .is_err()
+        );
+        assert!(authenticate(&cfg, Some(&service), "client", None)
+            .await
+            .is_err());
+        cfg.external_cert_auth = None;
+        assert_eq!(
+            authenticate(&cfg, Some(&service), "client", None)
+                .await
+                .unwrap(),
+            Some("service".into())
+        );
+        // Even without a configured certificate handler, verified TLS cannot
+        // inadvertently select the internal service/password authentication path.
+        assert!(
+            authenticate(&cfg, Some(&service), "client", Some("Harbour"))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
