@@ -248,7 +248,9 @@ async fn handle_auth(
     // a CONNECT password. A plaintext listener cannot claim a certificate identity.
     if let Some(cert_auth) = &config.external_cert_auth {
         let org = verified_cert_org.ok_or(Error::InvalidAuth)?;
-        if login.is_some_and(|login| login.username != org) || !cert_auth(client_id, org) {
+        if login.is_some_and(|login| login.username != org)
+            || !cert_auth(client_id.to_owned(), org.to_owned()).await
+        {
             return Err(Error::InvalidAuth);
         }
         return Ok(Some(org.to_owned()));
@@ -410,9 +412,9 @@ mod tests {
     #[tokio::test]
     async fn verified_cert_auth_uses_org_not_connect_username_or_password() {
         let mut cfg = config();
-        cfg.external_cert_auth = Some(Arc::new(|client, org| {
+        cfg.set_client_cert_auth_handler(|client, org| async move {
             client == "device" && org == "Harbour"
-        }));
+        });
         // A verified cert suffices without MQTT username/password.
         assert_eq!(
             authenticate(&cfg, None, "device", Some("Harbour"))
@@ -452,7 +454,7 @@ mod tests {
         };
         let mut cfg = config();
         cfg.auth = Some(HashMap::from([("service".into(), "secret".into())]));
-        cfg.external_cert_auth = Some(Arc::new(|_, _| false));
+        cfg.set_client_cert_auth_handler(|_, _| async { false });
         assert!(
             authenticate(&cfg, Some(&service), "client", Some("Harbour"))
                 .await
@@ -475,6 +477,28 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn async_cert_auth_false_denies_each_connect() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mut cfg = config();
+        let count = attempts.clone();
+        cfg.set_client_cert_auth_handler(move |_, _| {
+            let count = count.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                false // e.g. Bitfrost is unavailable
+            }
+        });
+        for _ in 0..2 {
+            assert!(authenticate(&cfg, None, "device", Some("Harbour"))
+                .await
+                .is_err());
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

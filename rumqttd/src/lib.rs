@@ -54,7 +54,11 @@ pub type AuthHandler = Arc<
 >;
 /// Called only with the organization from a verified client certificate (never CONNECT input).
 /// Arguments are the MQTT client ID and the certificate subject O, respectively.
-pub type ClientCertAuthHandler = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
+pub type ClientCertAuthHandler = Arc<
+    dyn Fn(ClientId, String) -> Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync,
+>;
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct Config {
@@ -141,11 +145,13 @@ impl ServerSettings {
 
     /// Enable certificate authentication on this listener. Requires rustls with
     /// `verify-client-cert` and a configured CA; never falls back to password auth.
-    pub fn set_client_cert_auth_handler<F>(&mut self, auth_fn: F)
+    pub fn set_client_cert_auth_handler<F, O>(&mut self, auth_fn: F)
     where
-        F: Fn(&str, &str) -> bool + Send + Sync + 'static,
+        F: Fn(ClientId, String) -> O + Send + Sync + 'static,
+        O: IntoFuture<Output = bool> + 'static,
+        O::IntoFuture: Send,
     {
-        self.connections.external_cert_auth = Some(Arc::new(auth_fn));
+        self.connections.set_client_cert_auth_handler(auth_fn);
     }
 }
 
@@ -194,6 +200,17 @@ impl ConnectionSettings {
         F: Fn(&ClientIdentity, AclAction, &str) -> bool + Send + Sync + 'static,
     {
         self.external_acl = Some(AclHandler::new(acl_fn));
+    }
+
+    pub fn set_client_cert_auth_handler<F, O>(&mut self, auth_fn: F)
+    where
+        F: Fn(ClientId, String) -> O + Send + Sync + 'static,
+        O: IntoFuture<Output = bool> + 'static,
+        O::IntoFuture: Send,
+    {
+        self.external_cert_auth = Some(Arc::new(move |client_id, org| {
+            Box::pin(auth_fn(client_id, org).into_future())
+        }));
     }
 }
 impl fmt::Debug for ConnectionSettings {
